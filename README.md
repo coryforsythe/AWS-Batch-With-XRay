@@ -1,3 +1,5 @@
+![logo.png](logo.png))
+
 # What's inside?
 This repository contains an example AWS Batch job that is pre-wired to support Xray Tracing.
 
