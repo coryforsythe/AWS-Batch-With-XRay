@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "An Example AWS CloudFormation Template to deploy an AWS Batch Python job with a compute environment that supports XRay Tracing"
+# Use public Systems Manager Parameter
+Parameters:
+    LatestAmiId:
+      Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+      Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    KeyName:
+      Type: 'String'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group for instances launched in the VPC by Batch
+      VpcId:
+        Ref: VPC
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId:
+        Ref: VPC
+      MapPublicIpOnLaunch: True
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      SubnetId:
+        Ref: Subnet
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+  IamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: IAMRole
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyDocument: {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "xray:PutTraceSegments",
+                        "xray:PutTelemetryRecords",
+                        "xray:GetSamplingRules",
+                        "xray:GetSamplingTargets",
+                        "xray:GetSamplingStatisticSummaries",
+                        "ec2:DescribeTags",
+                        "ecs:CreateCluster",
+                        "ecs:DeregisterContainerInstance",
+                        "ecs:DiscoverPollEndpoint",
+                        "ecs:Poll",
+                        "ecs:RegisterContainerInstance",
+                        "ecs:StartTelemetrySession",
+                        "ecs:UpdateContainerInstancesState",
+                        "ecs:Submit*",
+                        "ecr:GetAuthorizationToken",
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:BatchGetImage",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                    ],
+                    "Resource": [
+                        "*"
+                    ]
+                }
+            ]
+            }
+          PolicyName: AllowXray
+      
+  JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      ContainerProperties:
+        Image: "awscory/xraysample:latest" #Built from Dockerfile in this directory
+        Vcpus: 2
+        Memory: 2000
+        Command: 
+          - example.py
+      RetryStrategy:
+        Attempts: 1
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment:
+            Ref: ComputeEnvironment
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ComputeResources:
+        LaunchTemplate: 
+            LaunchTemplateId: 
+                Ref: XrayBatchLaunchTemplate
+            Version: 
+                Fn::GetAtt:
+                    - XrayBatchLaunchTemplate
+                    - LatestVersionNumber
+        Type: EC2
+        MinvCpus: 2
+        DesiredvCpus: 2
+        MaxvCpus: 64
+        InstanceTypes:
+          - optimal
+        Subnets:
+          - Ref: Subnet
+        SecurityGroupIds:
+          - Ref: SecurityGroup
+        InstanceRole:
+          Fn::GetAtt:
+            - IamInstanceProfile
+            - Arn
+      ServiceRole:
+        Fn::GetAtt:
+          - BatchServiceRole
+          - Arn
+  XrayBatchLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: XrayBatchLTV1 
+      LaunchTemplateData: 
+        IamInstanceProfile:
+          Arn:
+            Fn::GetAtt:
+              - IamInstanceProfile
+              - Arn
+        ImageId: !Ref LatestAmiId
+        KeyName: 
+            Ref: KeyName
+        UserData:  #Ideally this would be configurd via custom AMI so that proxy options could be set and installation of ecs agent,docker, and xray would not delay boot.
+            Fn::Base64: |
+              MIME-Version: 1.0
+              Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+              --==BOUNDARY==
+              MIME-Version: 1.0 
+
+              #!/bin/bash
+              amazon-linux-extras disable docker
+              amazon-linux-extras install -y ecs
+              /bin/systemctl enable --now --no-block ecs.service
+              curl https://s3.dualstack.us-east-2.amazonaws.com/aws-xray-assets.us-east-2/xray-daemon/aws-xray-daemon-3.x.rpm -o /home/ec2-user/xray.rpm
+              yum install -y /home/ec2-user/xray.rpm
+              /bin/systemctl restart xray.service
+              --==MYBOUNDARY==--
+Outputs:
+  ComputeEnvironmentArn:
+    Value:
+      Ref: ComputeEnvironment
+  JobQueueArn:
+    Value:
+      Ref: JobQueue
+  JobDefinitionArn:
+    Value:
+      Ref: JobDefinition
